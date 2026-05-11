@@ -20,15 +20,51 @@
 
 #include "cluster_direct_writer.h"
 
+#include <cstring>
 #include <string_view>
 
 #include "cluster/redis_slot.h"
-#include "common/string_util.h"
 #include "io_util.h"
 #include "logging.h"
 #include "server/redis_reply.h"
 
 static constexpr int kPipelineSize = 128;
+
+// Extract the key (second RESP bulk token) from a single complete RESP command.
+// Sets *key to an empty string_view for keyless commands (array_len < 2, e.g. FLUSHDB).
+// Returns false only on malformed input; caller treats that as a hard error.
+static bool ExtractRespKey(std::string_view cmd, std::string_view *key) {
+  if (cmd.empty() || cmd[0] != '*') return false;
+
+  const char *p = cmd.data();
+  const char *const end = p + cmd.size();
+
+  // Parse `prefix N \r\n`, advance p past the header, return N; -1 on error.
+  auto parseLen = [&](char prefix) -> int64_t {
+    if (p >= end || *p != prefix) return -1;
+    const char *cr = static_cast<const char *>(memchr(p + 1, '\r', end - p - 1));
+    if (!cr || cr + 1 >= end || cr[1] != '\n') return -1;
+    uint64_t n = 0;
+    for (const char *s = p + 1; s < cr; ++s) n = n * 10 + static_cast<uint8_t>(*s - '0');
+    p = cr + 2;
+    return static_cast<int64_t>(n);
+  };
+
+  int64_t array_len = parseLen('*');
+  if (array_len <= 0) return false;
+
+  int64_t cmd_len = parseLen('$');
+  if (cmd_len < 0 || static_cast<uint64_t>(end - p) < static_cast<uint64_t>(cmd_len) + 2) return false;
+  p += cmd_len + 2;
+
+  *key = {};
+  if (array_len < 2 || p >= end) return true;
+
+  int64_t key_len = parseLen('$');
+  if (key_len < 0 || static_cast<uint64_t>(end - p) < static_cast<uint64_t>(key_len) + 2) return false;
+  *key = std::string_view(p, static_cast<size_t>(key_len));
+  return true;
+}
 
 ClusterDirectWriter::ClusterDirectWriter(kvrocks2redis::Config *config) : Writer(config) {
   for (const auto &[ns, server] : config_->tokens) {
@@ -54,12 +90,7 @@ Status ClusterDirectWriter::Write(const std::string &ns, const std::vector<std::
 
   for (const auto &cmd : commands) {
     std::string_view key;
-    size_t consumed = 0;
-    auto result = util::ExtractRespKeyForRouting(cmd, &key, &consumed);
-    if (result == util::RespParseResult::NeedsMore) {
-      return {Status::NotOK, "cluster: incomplete RESP command for namespace " + ns};
-    }
-    if (result == util::RespParseResult::Error) {
+    if (!ExtractRespKey(cmd, &key)) {
       return {Status::NotOK, "cluster: RESP parse error in command for namespace " + ns};
     }
 

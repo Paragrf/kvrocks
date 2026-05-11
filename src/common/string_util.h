@@ -61,18 +61,6 @@ std::vector<std::string> RegexMatch(const std::string &str, const std::string &r
 std::string StringToHex(std::string_view input);
 std::vector<std::string> TokenizeRedisProtocol(const std::string &value);
 
-// Result of ParseRespCommand.
-enum class RespParseResult {
-  OK,        // one complete command parsed; bytes_consumed is set
-  NeedsMore, // input is incomplete; caller should append more data and retry
-  Error,     // input is malformed RESP
-};
-
-// Routing-only RESP scanner: extracts the key (second token) as a string_view
-// into `input` without any heap allocation, and computes total bytes consumed.
-// *key is empty for keyless commands (e.g. FLUSHDB).
-RespParseResult ExtractRespKeyForRouting(std::string_view input, std::string_view *key,
-                                         size_t *bytes_consumed);
 
 std::string EscapeString(std::string_view s);
 std::string StringNext(std::string s);
