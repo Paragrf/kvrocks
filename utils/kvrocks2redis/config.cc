@@ -95,6 +95,9 @@ Status Config::parseConfigFromString(const std::string &input) {
     cluster_enabled = GET_OR_RET(yesnotoi(args[0]).Prefixed("key 'cluster-enable'"));
   } else if (size == 1 && key == "cluster-enabled") {
     cluster_enabled = GET_OR_RET(yesnotoi(args[0]).Prefixed("key 'cluster-enabled'"));
+  } else if (size == 1 && key == "target-cluster-enabled") {
+    target_cluster_enabled =
+        GET_OR_RET(yesnotoi(args[0]).Prefixed("key 'target-cluster-enabled'"));
   } else if (size >= 2 && strncasecmp(key.data(), "namespace.", 10) == 0) {
     std::string ns = original_key.substr(10);
     if (ns.size() > INT8_MAX) {

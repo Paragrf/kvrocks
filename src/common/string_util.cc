@@ -500,6 +500,67 @@ std::vector<std::string> TokenizeRedisProtocol(const std::string &value) {
   return tokens;
 }
 
+
+RespParseResult ExtractRespKeyForRouting(std::string_view input, std::string_view *key,
+                                          size_t *bytes_consumed) {
+  if (input.empty()) return RespParseResult::NeedsMore;
+
+  const char *p = input.data();
+  const char *const end = p + input.size();
+  const char *crlf = nullptr;
+
+  // Inline decimal parser — no std::string temporary, no heap allocation.
+  auto scanLen = [](const char *start, const char *stop) -> uint64_t {
+    uint64_t n = 0;
+    for (; start < stop; ++start) n = n * 10 + static_cast<uint8_t>(*start - '0');
+    return n;
+  };
+
+  // Skip one bulk string ($len\r\nDATA\r\n); advances p on success.
+  auto skipBulk = [&]() -> RespParseResult {
+    if (p >= end || *p != '$') return RespParseResult::Error;
+    crlf = static_cast<const char *>(memchr(p + 1, '\r', end - p - 1));
+    if (!crlf || crlf + 1 >= end || crlf[1] != '\n') return RespParseResult::NeedsMore;
+    uint64_t len = scanLen(p + 1, crlf);
+    p = crlf + 2;
+    if (static_cast<uint64_t>(end - p) < len + 2) return RespParseResult::NeedsMore;
+    p += len + 2;
+    return RespParseResult::OK;
+  };
+
+  // 1. Array header: *N\r\n
+  if (*p != '*') return RespParseResult::Error;
+  crlf = static_cast<const char *>(memchr(p + 1, '\r', end - p - 1));
+  if (!crlf || crlf + 1 >= end || crlf[1] != '\n') return RespParseResult::NeedsMore;
+  uint64_t array_len = scanLen(p + 1, crlf);
+  if (array_len == 0) return RespParseResult::Error;
+  p = crlf + 2;
+
+  // 2. Skip command name (first bulk string).
+  if (auto r = skipBulk(); r != RespParseResult::OK) return r;
+
+  // 3. Extract key (second token) as string_view — zero copy.
+  *key = {};
+  if (array_len >= 2) {
+    if (p >= end || *p != '$') return RespParseResult::Error;
+    crlf = static_cast<const char *>(memchr(p + 1, '\r', end - p - 1));
+    if (!crlf || crlf + 1 >= end || crlf[1] != '\n') return RespParseResult::NeedsMore;
+    uint64_t key_len = scanLen(p + 1, crlf);
+    p = crlf + 2;
+    if (static_cast<uint64_t>(end - p) < key_len + 2) return RespParseResult::NeedsMore;
+    *key = std::string_view(p, key_len);
+    p += key_len + 2;
+  }
+
+  // 4. Skip remaining tokens to locate end of command (lengths only, no data copy).
+  for (uint64_t i = 2; i < array_len; ++i) {
+    if (auto r = skipBulk(); r != RespParseResult::OK) return r;
+  }
+
+  *bytes_consumed = static_cast<size_t>(p - input.data());
+  return RespParseResult::OK;
+}
+
 /* escape string where all the non-printable characters
  * (tested with isprint()) are turned into escapes in
  * the form "\n\r\a...." or "\x<hex-number>". */

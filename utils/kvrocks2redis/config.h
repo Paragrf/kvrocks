@@ -51,6 +51,7 @@ struct Config {
 
   std::map<std::string, RedisServer> tokens;
   bool cluster_enabled = false;
+  bool target_cluster_enabled = false;
 
   Status Load(std::string path);
   Config() = default;

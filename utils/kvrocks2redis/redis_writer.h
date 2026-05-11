@@ -48,12 +48,14 @@ class RedisWriter : public Writer {
   std::map<std::string, std::istream::off_type> next_offsets_;
   std::map<std::string, int> redis_fds_;
 
+  // ---- single-instance mode ----
   void sync();
-  Status getRedisConn(const std::string &ns, const std::string &host, uint32_t port, const std::string &auth,
-                      int db_index);
+  Status getRedisConn(const std::string &ns, const std::string &host, uint32_t port,
+                      const std::string &auth, int db_index);
   Status authRedis(const std::string &ns, const std::string &auth);
   Status selectDB(const std::string &ns, int db_number);
 
+  // ---- helpers ----
   Status updateNextOffset(const std::string &ns, std::istream::off_type offset);
   Status readNextOffsetFromFile(const std::string &ns, std::istream::off_type *offset);
   Status writeNextOffsetToFile(const std::string &ns, std::istream::off_type offset);

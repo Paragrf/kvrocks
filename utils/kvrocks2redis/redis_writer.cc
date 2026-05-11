@@ -24,9 +24,17 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <thread>
+
 #include "io_util.h"
 #include "server/redis_reply.h"
 #include "thread_util.h"
+
+static constexpr size_t kAofChunkSize = 4 * 1024 * 1024;
 
 RedisWriter::RedisWriter(kvrocks2redis::Config *config) : Writer(config) {
   auto t = util::CreateThread("redis-writer", [this]() {
@@ -50,29 +58,13 @@ RedisWriter::~RedisWriter() {
 }
 
 Status RedisWriter::Write(const std::string &ns, const std::vector<std::string> &aofs) {
-  auto s = Writer::Write(ns, aofs);
-  if (!s.IsOK()) {
-    return s;
-  }
-
-  return Status::OK();
+  return Writer::Write(ns, aofs);
 }
 
 Status RedisWriter::FlushDB(const std::string &ns) {
-  auto s = Writer::FlushDB(ns);
-  if (!s.IsOK()) {
-    return s;
-  }
-
-  s = updateNextOffset(ns, 0);
-  if (!s.IsOK()) {
-    return s;
-  }
-
-  s = Write(ns, {redis::ArrayOfBulkStrings({"FLUSHDB"})});
-  if (!s.IsOK()) return s;
-
-  return Status::OK();
+  GET_OR_RET(Writer::FlushDB(ns));
+  GET_OR_RET(updateNextOffset(ns, 0));
+  return Write(ns, {redis::ArrayOfBulkStrings({"FLUSHDB"})});
 }
 
 void RedisWriter::Stop() {
@@ -94,8 +86,7 @@ void RedisWriter::sync() {
     }
   }
 
-  size_t chunk_size = 4 * 1024 * 1024;
-  auto buffer = std::make_unique<char[]>(chunk_size);
+  auto buffer = std::make_unique<char[]>(kAofChunkSize);
   while (!stop_flag_) {
     for (const auto &iter : config_->tokens) {
       Status s = GetAofFd(iter.first);
@@ -111,7 +102,7 @@ void RedisWriter::sync() {
       }
 
       while (true) {
-        auto getted_line_leng = pread(aof_fds_[iter.first], buffer.get(), chunk_size, next_offsets_[iter.first]);
+        auto getted_line_leng = pread(aof_fds_[iter.first], buffer.get(), kAofChunkSize, next_offsets_[iter.first]);
         if (getted_line_leng <= 0) {
           if (getted_line_leng < 0) {
             ERROR("failed to read AOF file: {}", strerror(errno));
@@ -128,7 +119,7 @@ void RedisWriter::sync() {
 
         auto line_state = util::SockReadLine(redis_fds_[iter.first]);
         if (!line_state) {
-          ERROR("Failed to read redis response err: {}", s.Msg());
+          ERROR("Failed to read redis response err: {}", line_state.Msg());
           break;
         }
 
@@ -181,35 +172,24 @@ Status RedisWriter::getRedisConn(const std::string &ns, const std::string &host,
 }
 
 Status RedisWriter::authRedis(const std::string &ns, const std::string &auth) {
-  const auto auth_len_str = std::to_string(auth.length());
-  auto s = util::SockSend(redis_fds_[ns], "*2" CRLF "$4" CRLF "auth" CRLF "$" + auth_len_str + CRLF + auth + CRLF);
-  if (!s.IsOK()) {
-    return s.Prefixed("[kvrocks2redis] failed to send AUTH command");
-  }
+  auto s = util::SockSend(redis_fds_[ns], redis::ArrayOfBulkStrings({"AUTH", auth}));
+  if (!s.IsOK()) return s.Prefixed("[kvrocks2redis] failed to send AUTH command");
 
   std::string line = GET_OR_RET(util::SockReadLine(redis_fds_[ns]).Prefixed("read redis auth response err"));
   if (line.compare(0, 3, "+OK") != 0) {
     return {Status::NotOK, "[kvrocks2redis] redis Auth failed: " + line};
   }
-
   return Status::OK();
 }
 
 Status RedisWriter::selectDB(const std::string &ns, int db_number) {
-  const auto db_number_str = std::to_string(db_number);
-  const auto db_number_str_len = std::to_string(db_number_str.length());
-  auto s = util::SockSend(redis_fds_[ns],
-                          "*2" CRLF "$6" CRLF "select" CRLF "$" + db_number_str_len + CRLF + db_number_str + CRLF);
-  if (!s.IsOK()) {
-    return s.Prefixed("failed to send SELECT command to socket");
-  }
+  auto s = util::SockSend(redis_fds_[ns], redis::ArrayOfBulkStrings({"SELECT", std::to_string(db_number)}));
+  if (!s.IsOK()) return s.Prefixed("failed to send SELECT command to socket");
 
-  INFO("select db request was sent, waiting for response");
   std::string line = GET_OR_RET(util::SockReadLine(redis_fds_[ns]).Prefixed("read select db response err"));
   if (line.compare(0, 3, "+OK") != 0) {
     return {Status::NotOK, "[kvrocks2redis] redis select db failed: " + line};
   }
-
   return Status::OK();
 }
 
@@ -237,11 +217,8 @@ Status RedisWriter::readNextOffsetFromFile(const std::string &ns, std::istream::
 
 Status RedisWriter::writeNextOffsetToFile(const std::string &ns, std::istream::off_type offset) {
   std::string offset_string = std::to_string(offset);
-  // append to 256 byte (overwrite entire first 21 byte, aka the largest SequenceNumber size )
-  int append_byte = 256 - static_cast<int>(offset_string.size());
-  while (append_byte-- > 0) {
-    offset_string += " ";
-  }
+  // Pad to 256 bytes so subsequent shorter values fully overwrite the previous one.
+  offset_string.resize(256, ' ');
   offset_string += '\0';
   return util::Pwrite(next_offset_fds_[ns], offset_string, 0);
 }
@@ -249,3 +226,4 @@ Status RedisWriter::writeNextOffsetToFile(const std::string &ns, std::istream::o
 std::string RedisWriter::getNextOffsetFilePath(const std::string &ns) {
   return config_->output_dir + ns + "_" + config_->next_offset_file_name;
 }
+

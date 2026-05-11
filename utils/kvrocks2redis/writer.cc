@@ -42,6 +42,10 @@ Status Writer::Write(const std::string &ns, const std::vector<std::string> &aofs
   return Status::OK();
 }
 
+Status Writer::Write(const std::string &ns, std::string_view /*key*/, const std::string &cmd) {
+  return Write(ns, std::vector<std::string>{cmd});
+}
+
 Status Writer::FlushDB(const std::string &ns) {
   GET_OR_RET(GetAofFd(ns, true));
 

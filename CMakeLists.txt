@@ -311,14 +311,19 @@ add_executable(kvrocks src/cli/main.cc)
 target_link_libraries(kvrocks PRIVATE kvrocks_objs ${EXTERNAL_LIBS})
 
 # kvrocks2redis sync tool
+# All sources except main.cc go into a shared OBJECT library so that
+# individual modules can be linked into unittest without recompilation.
 file(GLOB KVROCKS2REDIS_SRCS utils/kvrocks2redis/*.cc)
-add_executable(kvrocks2redis ${KVROCKS2REDIS_SRCS})
+list(REMOVE_ITEM KVROCKS2REDIS_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/utils/kvrocks2redis/main.cc")
+add_library(kvrocks2redis_objs OBJECT ${KVROCKS2REDIS_SRCS})
+target_include_directories(kvrocks2redis_objs PUBLIC utils/kvrocks2redis)
+target_link_libraries(kvrocks2redis_objs PUBLIC kvrocks_objs)
 
-target_link_libraries(kvrocks2redis PRIVATE kvrocks_objs ${EXTERNAL_LIBS})
+add_executable(kvrocks2redis utils/kvrocks2redis/main.cc)
+target_link_libraries(kvrocks2redis PRIVATE kvrocks2redis_objs ${EXTERNAL_LIBS})
 
 # kvrocks unit tests
 file(GLOB_RECURSE TESTS_SRCS tests/cppunit/*.cc)
 add_executable(unittest ${TESTS_SRCS})
 target_include_directories(unittest PRIVATE tests/cppunit)
-
-target_link_libraries(unittest PRIVATE kvrocks_objs gtest_main gmock ${EXTERNAL_LIBS})
+target_link_libraries(unittest PRIVATE kvrocks2redis_objs kvrocks_objs gtest_main gmock ${EXTERNAL_LIBS})

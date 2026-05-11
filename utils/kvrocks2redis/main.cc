@@ -33,6 +33,7 @@
 #include "config/config.h"
 #include "io_util.h"
 #include "logging.h"
+#include "cluster_direct_writer.h"
 #include "parser.h"
 #include "redis_writer.h"
 #include "spdlog/common.h"
@@ -136,10 +137,16 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  RedisWriter writer(&config);
-  Parser parser(&storage, &writer);
+  std::unique_ptr<Writer> writer;
+  if (config.target_cluster_enabled) {
+    writer = std::make_unique<ClusterDirectWriter>(&config);
+  } else {
+    writer = std::make_unique<RedisWriter>(&config);
+  }
 
-  Sync sync(&storage, &writer, &parser, &config);
+  Parser parser(&storage, writer.get());
+
+  Sync sync(&storage, writer.get(), &parser, &config);
   hup_handler = [&sync] {
     if (!sync.IsStopped()) {
       INFO("Stopping sync");

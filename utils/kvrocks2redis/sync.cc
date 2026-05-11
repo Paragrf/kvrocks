@@ -183,7 +183,7 @@ Status Sync::readNextSeqFromFile(rocksdb::SequenceNumber *seq) {
   char buf[22];
   memset(buf, '\0', sizeof(buf));
   if (read(next_seq_fd_, buf, sizeof(buf)) > 0) {
-    *seq = static_cast<rocksdb::SequenceNumber>(std::stoi(buf));
+    *seq = static_cast<rocksdb::SequenceNumber>(std::stoull(buf));
   }
 
   return Status::OK();

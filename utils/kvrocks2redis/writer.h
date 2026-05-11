@@ -37,6 +37,9 @@ class Writer {
 
   ~Writer();
   virtual Status Write(const std::string &ns, const std::vector<std::string> &aofs);
+  // Keyed variant: caller already knows the routing key (full DB scan path).
+  // Default implementation ignores key and delegates to Write(ns, {cmd}).
+  virtual Status Write(const std::string &ns, std::string_view key, const std::string &cmd);
   virtual Status FlushDB(const std::string &ns);
   virtual void Stop() {}
   Status OpenAofFile(const std::string &ns, bool truncate);

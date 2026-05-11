@@ -68,12 +68,12 @@ Status Parser::parseSimpleKV(const Slice &ns_key, const Slice &value, uint64_t e
 
   auto command =
       redis::ArrayOfBulkStrings({"SET", user_key, value.ToString().substr(Metadata::GetOffsetAfterExpire(value[0]))});
-  Status s = writer_->Write(ns, {command});
+  Status s = writer_->Write(ns, user_key, command);
   if (!s.IsOK()) return s;
 
   if (expire > 0) {
     command = redis::ArrayOfBulkStrings({"EXPIREAT", user_key, std::to_string(expire / 1000)});
-    s = writer_->Write(ns, {command});
+    s = writer_->Write(ns, user_key, command);
   }
 
   return s;
@@ -135,14 +135,14 @@ Status Parser::parseComplexKV(const Slice &ns_key, const Metadata &metadata) {
     }
 
     if (type != kRedisBitmap) {
-      auto s = writer_->Write(ns, {output});
+      auto s = writer_->Write(ns, user_key, output);
       if (!s.IsOK()) return s.Prefixed(fmt::format("failed to write the '{}' command to AOF", output));
     }
   }
 
   if (metadata.expire > 0) {
     output = redis::ArrayOfBulkStrings({"EXPIREAT", user_key, std::to_string(metadata.expire / 1000)});
-    Status s = writer_->Write(ns, {output});
+    Status s = writer_->Write(ns, user_key, output);
     if (!s.IsOK()) return s.Prefixed("failed to write the EXPIREAT command to AOF");
   }
 
@@ -158,8 +158,8 @@ Status Parser::parseBitmapSegment(const Slice &ns, const Slice &user_key, int in
       if (!(bitmap[i] & (1 << j))) continue;  // ignore zero bit
 
       s = writer_->Write(
-          ns.ToString(),
-          {redis::ArrayOfBulkStrings({"SETBIT", user_key.ToString(), std::to_string(index * 8 + i * 8 + j), "1"})});
+          ns.ToString(), user_key.ToString(),
+          redis::ArrayOfBulkStrings({"SETBIT", user_key.ToString(), std::to_string(index * 8 + i * 8 + j), "1"}));
       if (!s.IsOK()) return s.Prefixed("failed to write SETBIT command to AOF");
     }
   }
