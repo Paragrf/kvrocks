@@ -317,10 +317,10 @@ file(GLOB KVROCKS2REDIS_SRCS utils/kvrocks2redis/*.cc)
 list(REMOVE_ITEM KVROCKS2REDIS_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/utils/kvrocks2redis/main.cc")
 add_library(kvrocks2redis_objs OBJECT ${KVROCKS2REDIS_SRCS})
 target_include_directories(kvrocks2redis_objs PUBLIC utils/kvrocks2redis)
-target_link_libraries(kvrocks2redis_objs PUBLIC kvrocks_objs)
+target_link_libraries(kvrocks2redis_objs PUBLIC kvrocks_objs ${EXTERNAL_LIBS})
 
 add_executable(kvrocks2redis utils/kvrocks2redis/main.cc)
-target_link_libraries(kvrocks2redis PRIVATE kvrocks2redis_objs ${EXTERNAL_LIBS})
+target_link_libraries(kvrocks2redis PRIVATE kvrocks2redis_objs kvrocks_objs ${EXTERNAL_LIBS})
 
 # kvrocks unit tests
 file(GLOB_RECURSE TESTS_SRCS tests/cppunit/*.cc)

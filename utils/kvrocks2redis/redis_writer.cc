@@ -63,8 +63,7 @@ Status RedisWriter::Write(const std::string &ns, const std::vector<std::string> 
 
 Status RedisWriter::FlushDB(const std::string &ns) {
   GET_OR_RET(Writer::FlushDB(ns));
-  GET_OR_RET(updateNextOffset(ns, 0));
-  return Write(ns, {redis::ArrayOfBulkStrings({"FLUSHDB"})});
+  return updateNextOffset(ns, 0);
 }
 
 void RedisWriter::Stop() {
