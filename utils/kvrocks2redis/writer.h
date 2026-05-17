@@ -22,6 +22,7 @@
 
 #include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,12 @@ class Writer {
   virtual Status Write(const std::string &ns, std::string_view key, const std::string &cmd);
   virtual Status FlushDB(const std::string &ns);
   virtual void Stop() {}
+  virtual Status FlushAll() { return Status::OK(); }
+  // Return a new independent writer of the same type sharing the same config.
+  // Used by ParseFullDB to spin up parallel worker writers.
+  virtual std::unique_ptr<Writer> createSibling() { return nullptr; }
+
+  kvrocks2redis::Config *getConfig() const { return config_; }
   Status OpenAofFile(const std::string &ns, bool truncate);
   Status GetAofFd(const std::string &ns, bool truncate = false);
   std::string GetAofFilePath(const std::string &ns);

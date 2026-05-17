@@ -86,6 +86,8 @@ void RedisWriter::sync() {
   }
 
   auto buffer = std::make_unique<char[]>(kAofChunkSize);
+  uint64_t total_bytes_sent = 0;
+  auto last_rw_log = std::chrono::steady_clock::now();
   while (!stop_flag_) {
     for (const auto &iter : config_->tokens) {
       Status s = GetAofFd(iter.first);
@@ -114,6 +116,7 @@ void RedisWriter::sync() {
         if (!s.IsOK()) {
           ERROR("Failed to send data to redis err: {}", s.Msg());
           break;
+        total_bytes_sent += getted_line_leng;
         }
 
         auto line_state = util::SockReadLine(redis_fds_[iter.first]);
@@ -137,6 +140,7 @@ void RedisWriter::sync() {
           break;
         }
       }
+    { auto _now = std::chrono::steady_clock::now(); if (std::chrono::duration_cast<std::chrono::seconds>(_now - last_rw_log).count() >= 30) { INFO("[redis_writer] alive, bytes_sent={}", total_bytes_sent); last_rw_log = _now; } }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }

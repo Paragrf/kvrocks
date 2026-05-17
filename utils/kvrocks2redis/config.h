@@ -52,6 +52,8 @@ struct Config {
   std::map<std::string, RedisServer> tokens;
   bool cluster_enabled = false;
   bool target_cluster_enabled = false;
+  int parse_workers = 2;  // parallel workers for ParseFullDB (1 = single-threaded)
+  bool skip_full_sync = false;  // skip full re-scan on WAL gap, jump to nearest available WAL
 
   Status Load(std::string path);
   Config() = default;

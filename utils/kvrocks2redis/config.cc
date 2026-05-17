@@ -98,6 +98,13 @@ Status Config::parseConfigFromString(const std::string &input) {
   } else if (size == 1 && key == "target-cluster-enabled") {
     target_cluster_enabled =
         GET_OR_RET(yesnotoi(args[0]).Prefixed("key 'target-cluster-enabled'"));
+  } else if (size == 1 && key == "skip-full-sync") {
+    skip_full_sync = GET_OR_RET(yesnotoi(args[0]).Prefixed("key 'skip-full-sync'"));
+  } else if (size == 1 && key == "parse-workers") {
+    parse_workers = GET_OR_RET(ParseInt<int>(args[0]).Prefixed("key 'parse-workers'"));
+    if (parse_workers < 1 || parse_workers > 64) {
+      return {Status::NotOK, "'parse-workers' must be between 1 and 64"};
+    }
   } else if (size >= 2 && strncasecmp(key.data(), "namespace.", 10) == 0) {
     std::string ns = original_key.substr(10);
     if (ns.size() > INT8_MAX) {

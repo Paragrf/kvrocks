@@ -21,6 +21,7 @@
 #include "cluster_direct_writer.h"
 
 #include <cstring>
+#include <map>
 #include <string_view>
 
 #include "cluster/redis_slot.h"
@@ -28,7 +29,7 @@
 #include "logging.h"
 #include "server/redis_reply.h"
 
-static constexpr int kPipelineSize = 128;
+static constexpr int kPipelineSize = 8192;
 
 // Extract the key (second RESP bulk token) from a single complete RESP command.
 // Sets *key to an empty string_view for keyless commands (array_len < 2, e.g. FLUSHDB).
@@ -121,12 +122,38 @@ Status ClusterDirectWriter::Write(const std::string &ns, const std::vector<std::
 
 Status ClusterDirectWriter::Write(const std::string &ns, std::string_view key, const std::string &cmd) {
   if (key.empty()) {
+    GET_OR_RET(flushPending(ns));
     return sendToAllMasters(ns, cmd);
   }
   uint16_t slot = GetSlotIdFromKey(key);
   int node_idx = topologies_[ns].nodeForSlot(slot);
-  NodeBuffer nb{cmd, 1};
-  return flushNodeBuffer(ns, node_idx, nb);
+  auto &nb = write_buf_[ns][node_idx];
+  nb.buf += cmd;
+  nb.count++;
+  if (nb.count >= kPipelineSize) {
+    return flushNodeBuffer(ns, node_idx, nb);
+  }
+  return Status::OK();
+}
+
+Status ClusterDirectWriter::FlushAll() {
+  for (auto &[ns, _] : write_buf_) {
+    GET_OR_RET(flushPending(ns));
+  }
+  return Status::OK();
+}
+
+Status ClusterDirectWriter::flushPending(const std::string &ns) {
+  auto it = write_buf_.find(ns);
+  if (it == write_buf_.end()) return Status::OK();
+  for (auto &[node_idx, nb] : it->second) {
+    GET_OR_RET(flushNodeBuffer(ns, node_idx, nb));
+  }
+  return Status::OK();
+}
+
+std::unique_ptr<Writer> ClusterDirectWriter::createSibling() {
+  return std::make_unique<ClusterDirectWriter>(config_);
 }
 
 Status ClusterDirectWriter::FlushDB(const std::string &ns) {
@@ -154,21 +181,26 @@ Status ClusterDirectWriter::flushNodeBuffer(const std::string &ns, int node_idx,
   if (!conn_s.IsOK()) return refresh_on_error(conn_s.Prefixed("cluster: pipeline connect"));
 
   int fd = topo.fd(node_idx);
+  // Log first flush to each node, then every 50000th, to track progress without flooding.
+  static std::map<int,uint64_t> flush_counts;
+  flush_counts[node_idx]++;
+  bool should_log = (flush_counts[node_idx] == 1) || (flush_counts[node_idx] % 50000 == 0);
+  if (should_log) {
+    INFO("[flush] node={} fd={} total_flushes={} count={} buf={}B",
+         node_idx, fd, flush_counts[node_idx], nb.count, nb.buf.size());
+  }
   auto send_s = util::SockSend(fd, nb.buf);
   if (!send_s.IsOK()) {
     topo.closeFd(node_idx);
     return refresh_on_error(send_s.Prefixed("cluster: pipeline send"));
   }
 
-  for (int i = 0; i < nb.count; i++) {
-    auto line_or = util::SockReadLine(fd);
-    if (!line_or.IsOK()) {
-      topo.closeFd(node_idx);
-      return refresh_on_error(line_or.ToStatus().Prefixed("cluster: pipeline read"));
-    }
-    if (!line_or->empty() && (*line_or)[0] == '-') {
-      return {Status::NotOK, "cluster: Redis error in pipeline: " + *line_or};
-    }
+  if (auto drain_s = topo.drainResponses(node_idx, nb.count); !drain_s.IsOK()) {
+    topo.closeFd(node_idx);
+    return refresh_on_error(drain_s.Prefixed("cluster: pipeline drain"));
+  }
+  if (should_log) {
+    INFO("[flush] node={} flush #{} complete", node_idx, flush_counts[node_idx]);
   }
 
   nb.buf.clear();
@@ -181,7 +213,9 @@ Status ClusterDirectWriter::sendToAllMasters(const std::string &ns, const std::s
   auto &topo = topologies_[ns];
   const auto &server = config_->tokens.at(ns);
 
+  INFO("[sendToAll] ns={} total_nodes={}", ns, topo.nodeCount());
   for (int i = 0; i < static_cast<int>(topo.nodeCount()); i++) {
+    INFO("[sendToAll] node[{}] {}:{} connecting...", i, topo.node(i).host, topo.node(i).port);
     auto conn_s = topo.ensureConnected(i, server.auth);
     if (!conn_s.IsOK()) {
       const auto &node = topo.node(i);
@@ -190,6 +224,7 @@ Status ClusterDirectWriter::sendToAllMasters(const std::string &ns, const std::s
       continue;
     }
     int fd = topo.fd(i);
+    INFO("[sendToAll] node[{}] connected fd={}, sending...", i, topo.fd(i));
     auto send_s = util::SockSend(fd, cmd);
     if (!send_s.IsOK()) {
       topo.closeFd(i);
@@ -212,5 +247,6 @@ Status ClusterDirectWriter::sendToAllMasters(const std::string &ns, const std::s
       if (first_err.IsOK()) first_err = {Status::NotOK, *line_or};
     }
   }
+  INFO("[sendToAll] done status={}", first_err.IsOK() ? "OK" : first_err.Msg());
   return first_err;
 }

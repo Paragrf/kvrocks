@@ -49,6 +49,15 @@ class ClusterTopology {
   // Open a connection to node_idx if not already open.
   Status ensureConnected(int node_idx, const std::string &auth);
 
+  // Read one \r\n-terminated line from node_idx using a persistent buffer.
+  // Drop-in replacement for util::SockReadLine(fd) that never discards buffered data.
+  StatusOr<std::string> readLineFromNode(int node_idx);
+
+  // Drain exactly `count` single-line RESP responses from node_idx in one pass.
+  // Returns NotOK immediately if any response starts with '-' (Redis error).
+  // Much faster than calling readLineFromNode() count times for large pipelines.
+  Status drainResponses(int node_idx, int count);
+
   // Close and invalidate the connection to node_idx.
   void closeFd(int node_idx);
 
@@ -64,7 +73,13 @@ class ClusterTopology {
  private:
   std::vector<Node> nodes_;
   std::vector<uint16_t> slot_nodes_;  // 16384-element slot→node-index table
-  std::map<int, int> fds_;            // node_index → socket fd
+  struct ReadBuf {
+    std::string data;
+    size_t offset = 0;
+  };
+
+  std::map<int, int> fds_;         // node_index → socket fd
+  std::map<int, ReadBuf> read_bufs_;  // node_index → persistent read buffer (offset-based)
 
   // Open a TCP connection to host:port and run AUTH if auth is non-empty.
   static StatusOr<int> connectNode(const std::string &host, uint16_t port,
@@ -75,9 +90,4 @@ class ClusterTopology {
   static Status parseClusterSlots(int topo_fd, std::vector<Node> &nodes,
                                   std::vector<uint16_t> &slots);
 
-  // Typed RESP line readers used only inside parseClusterSlots.
-  static StatusOr<int64_t> readRespInt(int fd);
-  static StatusOr<std::string> readRespBulkString(int fd);
-  static Status skipRespValue(int fd);
-  static Status skipRespArray(int fd, int count);
 };

@@ -64,6 +64,7 @@ class Sync {
 
   Status tryCatchUpWithPrimary();
   Status checkWalBoundary();
+  Status advanceToNearestWAL();
 
   void parseKVFromLocalStorage();
 

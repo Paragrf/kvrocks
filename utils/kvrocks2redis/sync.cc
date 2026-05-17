@@ -62,11 +62,20 @@ void Sync::Start() {
   while (!IsStopped()) {
     s = checkWalBoundary();
     if (!s.IsOK()) {
-      parseKVFromLocalStorage();
+      if (config_->skip_full_sync) {
+        s = advanceToNearestWAL();
+        if (!s.IsOK()) {
+          ERROR("[sync] skip-full-sync: cannot find any WAL to advance to: {}", s.Msg());
+          sleep(5);
+        }
+      } else {
+        parseKVFromLocalStorage();
+      }
     }
     s = incrementBatchLoop();
     if (!s.IsOK()) {
-      ERROR("{}", s.Msg());
+      if (!s.Msg().empty()) ERROR("[sync] incrementBatchLoop error: {}", s.Msg());
+      sleep(2);
     }
   }
 }
@@ -84,61 +93,132 @@ Status Sync::tryCatchUpWithPrimary() {
 }
 
 Status Sync::checkWalBoundary() {
-  if (next_seq_ == storage_->LatestSeqNumber() + 1) {
+  auto latest = storage_->LatestSeqNumber();
+  DEBUG("[checkWAL] next_seq_={}, latest_seq={}", next_seq_, latest);
+
+  if (next_seq_ == latest + 1) {
+    DEBUG("[checkWAL] caught up exactly, proceed to incremental");
     return Status::OK();
   }
 
-  // Upper bound
-  if (next_seq_ > storage_->LatestSeqNumber() + 1) {
+  // Upper bound: next_seq_ jumped ahead of the secondary — need full re-scan
+  if (next_seq_ > latest + 1) {
+    WARN("[checkWAL] next_seq_={} > latest+1={}, next_seq_ is ahead of secondary — forcing full re-scan",
+         next_seq_, latest + 1);
     return {Status::NotOK};
   }
 
-  // Lower bound
+  // Lower bound: verify WAL still has seq
   std::unique_ptr<rocksdb::TransactionLogIterator> iter;
   auto s = storage_->GetWALIter(next_seq_, &iter);
   if (s.IsOK() && iter->Valid()) {
     auto batch = iter->GetBatch();
     if (next_seq_ != batch.sequence) {
       if (next_seq_ > batch.sequence) {
-        ERROR("checkWALBoundary with sequence: {}, but GetWALIter return older sequence: {}", next_seq_,
-              batch.sequence);
+        ERROR("[checkWAL] sequence mismatch: next_seq_={}, WAL returned seq={}", next_seq_, batch.sequence);
+      } else {
+        WARN("[checkWAL] WAL gap: next_seq_={}, first available WAL seq={} — WAL compacted, forcing full re-scan",
+             next_seq_, batch.sequence);
       }
       return {Status::NotOK};
     }
+    DEBUG("[checkWAL] WAL boundary OK at seq={}", next_seq_);
     return Status::OK();
   }
+  WARN("[checkWAL] GetWALIter(seq={}) returned invalid iter (s={}), forcing full re-scan",
+       next_seq_, s.IsOK() ? "ok" : s.Msg());
   return {Status::NotOK};
 }
 
+Status Sync::advanceToNearestWAL() {
+  std::unique_ptr<rocksdb::TransactionLogIterator> iter;
+  // GetUpdatesSince with next_seq_: if WAL was compacted, RocksDB returns the first available entry
+  auto gs = storage_->GetDB()->GetUpdatesSince(next_seq_, &iter);
+  if (gs.ok() && iter && iter->Valid()) {
+    auto batch = iter->GetBatch();
+    if (batch.sequence > next_seq_) {
+      WARN("[sync] skip-full-sync: WAL gap detected, advancing next_seq_ {} → {} (skipping {} seqs)",
+           next_seq_, batch.sequence, batch.sequence - next_seq_);
+      return updateNextSeq(batch.sequence);
+    }
+    // No gap, next_seq_ is already valid
+    return Status::OK();
+  }
+  // Try from seq=0 to find the absolute first available WAL
+  gs = storage_->GetDB()->GetUpdatesSince(0, &iter);
+  if (gs.ok() && iter && iter->Valid()) {
+    auto batch = iter->GetBatch();
+    WARN("[sync] skip-full-sync: advancing next_seq_ {} → first available WAL seq={}",
+         next_seq_, batch.sequence);
+    return updateNextSeq(batch.sequence);
+  }
+  return {Status::NotOK, "no WAL entries found"};
+}
+
 Status Sync::incrementBatchLoop() {
-  INFO("Start parsing increment data");
+  INFO("[incr] start: next_seq_={}, secondary_latest={}", next_seq_, storage_->LatestSeqNumber());
+  uint64_t batch_count = 0, cmd_count = 0;
+  auto last_log_time = std::chrono::steady_clock::now();
+  auto last_catchup_log = std::chrono::steady_clock::now();
   std::unique_ptr<rocksdb::TransactionLogIterator> iter;
   while (!IsStopped()) {
     if (!tryCatchUpWithPrimary().IsOK()) {
-      return {Status::NotOK};
+      WARN("[incr] TryCatchUpWithPrimary failed (next_seq_={}, latest={}), retrying in 1s",
+           next_seq_, storage_->LatestSeqNumber());
+      sleep(1);
+      continue;
     }
-    if (next_seq_ <= storage_->LatestSeqNumber()) {
-      storage_->GetDB()->GetUpdatesSince(next_seq_, &iter);
+
+    auto latest = storage_->LatestSeqNumber();
+    if (next_seq_ <= latest) {
+      DEBUG("[incr] behind: next_seq_={}, latest={}, lag={}", next_seq_, latest, latest - next_seq_);
+      auto gs = storage_->GetDB()->GetUpdatesSince(next_seq_, &iter);
+      if (!gs.ok()) {
+        ERROR("[incr] GetUpdatesSince(seq={}) failed: {} — WAL likely compacted, forcing re-scan",
+              next_seq_, gs.ToString());
+        return {Status::NotOK, fmt::format("GetUpdatesSince failed: {}", gs.ToString())};
+      }
+      if (!iter->Valid()) {
+        WARN("[incr] GetUpdatesSince(seq={}) returned empty iterator (latest={}) — WAL gap?",
+             next_seq_, latest);
+        return {Status::NotOK, "GetUpdatesSince returned empty iterator"};
+      }
+      int batch_this_round = 0;
       for (; iter->Valid(); iter->Next()) {
         auto batch = iter->GetBatch();
         if (batch.sequence != next_seq_) {
           if (next_seq_ > batch.sequence) {
-            ERROR("checkWALBoundary with sequence: {}, but GetWALIter return older sequence: {}", next_seq_,
-                  batch.sequence);
+            ERROR("[incr] sequence mismatch: expected={}, got={}", next_seq_, batch.sequence);
+            return {Status::NotOK};
+          } else {
+            WARN("[incr] WAL gap: expected seq={}, first batch seq={}", next_seq_, batch.sequence);
+            if (config_->skip_full_sync) {
+              WARN("[incr] skip-full-sync: jumping next_seq_ {} → {}", next_seq_, batch.sequence);
+              if (auto su = updateNextSeq(batch.sequence); !su.IsOK()) return su;
+              break;  // re-enter while loop, will process from new next_seq_ on next iteration
+            }
+            return {Status::NotOK};
           }
-          return {Status::NotOK};
         }
         auto s = parser_->ParseWriteBatch(batch.writeBatchPtr->Data());
         if (!s.IsOK()) {
           return s.Prefixed(
               fmt::format("failed to parse write batch '{}'", util::StringToHex(batch.writeBatchPtr->Data())));
         }
-        s = updateNextSeq(next_seq_ + batch.writeBatchPtr->Count());
+        uint64_t cnt = batch.writeBatchPtr->Count();
+        s = updateNextSeq(next_seq_ + cnt);
+        batch_count++;
+        batch_this_round++;
+        cmd_count += cnt;
+        { auto _now = std::chrono::steady_clock::now(); if (std::chrono::duration_cast<std::chrono::seconds>(_now - last_log_time).count() >= 30) { auto lag = storage_->LatestSeqNumber() > next_seq_ ? storage_->LatestSeqNumber() - next_seq_ : 0; INFO("[incr] next_seq={}, lag={}, batches/30s={}, cmds/30s={}", next_seq_, lag, batch_count, cmd_count); batch_count = 0; cmd_count = 0; last_log_time = _now; } }
         if (!s.IsOK()) {
           return s.Prefixed("failed to update next sequence");
         }
       }
+      DEBUG("[incr] processed {} batches this round, next_seq_={}", batch_this_round, next_seq_);
     } else {
+      // Caught up: throttle log to every 30s
+      { auto _now = std::chrono::steady_clock::now(); if (std::chrono::duration_cast<std::chrono::seconds>(_now - last_catchup_log).count() >= 30) { INFO("[incr] caught up, next_seq_={}, latest={}", next_seq_, latest); batch_count = 0; cmd_count = 0; last_catchup_log = _now; } }
       usleep(10000);
     }
   }
@@ -147,20 +227,21 @@ Status Sync::incrementBatchLoop() {
 
 void Sync::parseKVFromLocalStorage() {
   INFO("Start parsing kv from the local storage");
-  for (const auto &iter : config_->tokens) {
-    auto s = writer_->FlushDB(iter.first);
-    if (!s.IsOK()) {
-      ERROR("Failed to flush target redis db in namespace: {}, encounter error: {}", iter.first, s.Msg());
-      return;
-    }
-  }
-
+  INFO("[parseKV] FlushDB skipped; starting ParseFullDB");
+  INFO("[parseKV] secondary latest_seq before scan: {}", storage_->LatestSeqNumber());
   Status s = parser_->ParseFullDB();
+  INFO("[parseKV] ParseFullDB returned: {}", s.IsOK() ? "OK" : s.Msg());
+  if (s.IsOK()) {
+    s = writer_->FlushAll();
+    INFO("[parseKV] FlushAll returned: {}", s.IsOK() ? "OK" : s.Msg());
+  }
   if (!s.IsOK()) {
-    ERROR("Failed to parse full db, encounter error: {}", s.Msg());
+    ERROR("Failed to parse full db, encounter error: {} — backing off 5s before retry", s.Msg());
+    sleep(5);
     return;
   }
   auto last_seq = storage_->GetDB()->GetLatestSequenceNumber();
+  INFO("[parseKV] full scan done, secondary latest_seq={}, will set next_seq_={}", last_seq, last_seq + 1);
   s = updateNextSeq(last_seq + 1);
   if (!s.IsOK()) {
     ERROR("Failed to update next sequence: {}", s.Msg());

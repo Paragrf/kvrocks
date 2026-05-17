@@ -43,6 +43,8 @@ class ClusterDirectWriter : public Writer {
   Status Write(const std::string &ns, const std::vector<std::string> &commands) override;
   Status Write(const std::string &ns, std::string_view key, const std::string &cmd) override;
   Status FlushDB(const std::string &ns) override;
+  Status FlushAll() override;
+  std::unique_ptr<Writer> createSibling() override;
 
  private:
   struct NodeBuffer {
@@ -52,6 +54,8 @@ class ClusterDirectWriter : public Writer {
 
   std::map<std::string, ClusterTopology> topologies_;  // ns → topology + connections
 
+  std::map<std::string, std::map<int, NodeBuffer>> write_buf_;
   Status flushNodeBuffer(const std::string &ns, int node_idx, NodeBuffer &nb);
+  Status flushPending(const std::string &ns);
   Status sendToAllMasters(const std::string &ns, const std::string &cmd);
 };
